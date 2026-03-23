@@ -512,10 +512,24 @@ export default function App() {
   const startRecording = async () => {
     if (isListeningRef.current) return;
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("您的浏览器不支持麦克风访问。请尝试使用最新版本的 Chrome, Safari 或 Edge。");
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = stream;
 
-      const mediaRecorder = new MediaRecorder(stream);
+      // Determine supported MIME type
+      let mimeType = 'audio/webm';
+      if (typeof MediaRecorder === 'undefined') {
+        throw new Error("您的浏览器不支持 MediaRecorder API。");
+      }
+
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : 'audio/ogg';
+      }
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -528,13 +542,19 @@ export default function App() {
       mediaRecorder.onstop = async () => {
         setIsListening(false);
         if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        if (micAudioContextRef.current) micAudioContextRef.current.close();
+        if (micAudioContextRef.current) {
+          try {
+            await micAudioContextRef.current.close();
+          } catch (e) {}
+        }
         micStreamRef.current?.getTracks().forEach(track => track.stop());
 
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const finalMimeType = mediaRecorder.mimeType || mimeType;
+        const audioBlob = new Blob(audioChunksRef.current, { type: finalMimeType });
         audioChunksRef.current = [];
 
         if (audioBlob.size === 0) {
+          console.warn("Audio blob is empty");
           if (autoListenRef.current && !isLoadingRef.current && !isPlayingRef.current) {
             setTimeout(startRecording, 500);
           }
@@ -545,7 +565,7 @@ export default function App() {
         reader.readAsDataURL(audioBlob);
         reader.onloadend = async () => {
           const base64data = (reader.result as string).split(',')[1];
-          const mimeType = audioBlob.type.split(';')[0] || 'audio/webm';
+          const sendMimeType = finalMimeType.split(';')[0];
 
           setIsLoading(true);
           try {
@@ -558,7 +578,7 @@ export default function App() {
                     {
                       inlineData: {
                         data: base64data,
-                        mimeType: mimeType,
+                        mimeType: sendMimeType,
                       }
                     },
                     {
@@ -589,11 +609,19 @@ export default function App() {
         };
       };
 
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioCtx = new AudioContextClass();
       micAudioContextRef.current = audioCtx;
+      
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
-      analyser.minDecibels = -50;
+      // Increase sensitivity
+      analyser.minDecibels = -90;
+      analyser.fftSize = 256;
       source.connect(analyser);
 
       const checkSilence = () => {
@@ -601,7 +629,8 @@ export default function App() {
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(dataArray);
-        const isSpeaking = dataArray.some(val => val > 5);
+        // More sensitive threshold
+        const isSpeaking = dataArray.some(val => val > 20);
 
         if (isSpeaking) {
           if (silenceTimerRef.current) {
@@ -614,15 +643,20 @@ export default function App() {
               if (mediaRecorder.state === 'recording') {
                 mediaRecorder.stop();
               }
-            }, 2000);
+            }, 3000); // Increased to 3 seconds for better mobile experience
           }
         }
         requestAnimationFrame(checkSilence);
       };
 
-      mediaRecorder.start();
-      setIsListening(true);
-      checkSilence();
+      // Start recording. Some browsers need a small delay after stream is ready.
+      setTimeout(() => {
+        if (mediaRecorder.state === 'inactive') {
+          mediaRecorder.start(1000);
+          setIsListening(true);
+          checkSilence();
+        }
+      }, 100);
 
     } catch (error) {
       console.error("Error accessing microphone:", error);
@@ -631,7 +665,7 @@ export default function App() {
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'assistant',
-        content: '麦克风访问失败，请检查设备连接或浏览器权限。'
+        content: `麦克风访问失败：${error instanceof Error ? error.message : String(error)}。请确保已授予麦克风权限，且正在使用 HTTPS 安全连接。如果是 iOS 设备，请尝试在 Safari 浏览器中打开。`
       }]);
     }
   };
@@ -671,34 +705,34 @@ export default function App() {
       <div className="flex flex-col w-full md:w-1/2 lg:w-7/12 border-r border-[#30363d] bg-[#0d1117] relative">
         <RobotAvatar isPlaying={isPlaying} analyser={analyserNode} />
         {/* Header */}
-        <header className="flex items-center justify-between p-4 border-b border-[#30363d] bg-[#161b22]">
-          <div className="flex items-center gap-3">
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between p-4 border-b border-[#30363d] bg-[#161b22] gap-4 shrink-0">
+          <div className="flex items-center gap-3 shrink-0">
             <div className="p-2 bg-[#1f6feb]/10 rounded-lg border border-[#1f6feb]/30">
               <ShieldCheck className="w-6 h-6 text-[#58a6ff]" />
             </div>
             <div>
-              <h1 className="text-lg font-semibold text-white tracking-wide">Crew-8615 HSE Assistant</h1>
-              <p className="text-xs text-[#8b949e] font-mono">CNPC BGP Crew 8615 // ADNOC Standard</p>
+              <h1 className="text-base sm:text-lg font-semibold text-white tracking-wide">Crew-8615 HSE Assistant</h1>
+              <p className="text-[10px] sm:text-xs text-[#8b949e] font-mono">CNPC BGP Crew 8615 // ADNOC Standard</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 overflow-x-auto pb-2 sm:pb-0 w-full sm:w-auto scrollbar-hide">
             <button
               onClick={() => setShowSettings(true)}
-              className="p-2 text-[#8b949e] hover:text-white hover:bg-[#21262d] rounded-md transition-colors border border-transparent hover:border-[#30363d]"
+              className="p-2 text-[#8b949e] hover:text-white hover:bg-[#21262d] rounded-md transition-colors border border-transparent hover:border-[#30363d] shrink-0"
               title="Voice Settings"
             >
               <Settings className="w-5 h-5" />
             </button>
             <button 
               onClick={() => setShowUpdateModal(true)}
-              className="flex items-center gap-2 px-3 py-2 bg-[#21262d] hover:bg-[#30363d] border border-[#30363d] rounded-md text-sm text-[#c9d1d9] transition-colors"
+              className="flex items-center gap-2 px-3 py-2 bg-[#21262d] hover:bg-[#30363d] border border-[#30363d] rounded-md text-sm text-[#c9d1d9] transition-colors shrink-0 whitespace-nowrap"
             >
               <Database className="w-4 h-4" />
               更新数据
             </button>
             <button 
               onClick={() => setShowDashboard(true)}
-              className="flex items-center gap-2 px-3 py-2 bg-[#2ea043] hover:bg-[#3fb950] text-white rounded-md text-sm font-medium transition-colors shadow-[0_0_15px_rgba(46,160,67,0.3)]"
+              className="flex items-center gap-2 px-3 py-2 bg-[#2ea043] hover:bg-[#3fb950] text-white rounded-md text-sm font-medium transition-colors shadow-[0_0_15px_rgba(46,160,67,0.3)] shrink-0 whitespace-nowrap"
             >
               <BarChart2 className="w-4 h-4" />
               全景看板
@@ -706,7 +740,7 @@ export default function App() {
             <button 
               onClick={toggleAutoListen}
               className={cn(
-                "flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors border",
+                "flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors border shrink-0 whitespace-nowrap",
                 autoListen 
                   ? "bg-[#1f6feb]/20 text-[#58a6ff] border-[#1f6feb]/50" 
                   : "bg-transparent text-[#8b949e] border-[#30363d] hover:text-[#c9d1d9]"
@@ -718,7 +752,7 @@ export default function App() {
             <button 
               onClick={handleInduction}
               disabled={isLoading}
-              className="flex items-center gap-2 px-4 py-2 bg-[#238636] hover:bg-[#2ea043] text-white rounded-md text-sm font-medium transition-colors disabled:opacity-50"
+              className="flex items-center gap-2 px-4 py-2 bg-[#238636] hover:bg-[#2ea043] text-white rounded-md text-sm font-medium transition-colors disabled:opacity-50 shrink-0 whitespace-nowrap"
             >
               <Zap className="w-4 h-4" />
               一键 Induction
@@ -788,7 +822,7 @@ export default function App() {
             <button 
               onClick={toggleListening}
               className={cn(
-                "p-2 transition-colors rounded-lg z-10",
+                "p-2 transition-colors rounded-lg z-10 shrink-0",
                 isListening ? "text-[#ff7b72] bg-[#ff7b72]/10" : "text-[#8b949e] hover:text-[#c9d1d9]"
               )}
             >
@@ -797,7 +831,7 @@ export default function App() {
             <select
               value={micLang}
               onChange={(e) => setMicLang(e.target.value)}
-              className="bg-transparent text-xs text-[#8b949e] border-none outline-none cursor-pointer z-10 hover:text-[#c9d1d9] transition-colors"
+              className="bg-transparent text-xs text-[#8b949e] border-none outline-none cursor-pointer z-10 hover:text-[#c9d1d9] transition-colors shrink-0 w-16 sm:w-auto"
               title="语音输入语言"
             >
               <option value="zh-CN">中文</option>
@@ -809,14 +843,14 @@ export default function App() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend(input)}
-              placeholder={isListening ? "正在聆听..." : "输入指令或点击麦克风说话..."}
-              className="flex-1 bg-transparent border-none outline-none text-[#c9d1d9] placeholder:text-[#8b949e] px-2 z-10"
+              placeholder={isListening ? "正在聆听..." : "输入指令..."}
+              className="flex-1 bg-transparent border-none outline-none text-[#c9d1d9] placeholder:text-[#8b949e] px-2 z-10 min-w-0"
               disabled={isLoading}
             />
             <button 
               onClick={() => handleSend(input)}
               disabled={!input.trim() || isLoading}
-              className="p-2 bg-[#1f6feb] hover:bg-[#388bfd] disabled:bg-[#1f6feb]/50 text-white rounded-lg transition-colors z-10"
+              className="p-2 bg-[#1f6feb] hover:bg-[#388bfd] disabled:bg-[#1f6feb]/50 text-white rounded-lg transition-colors z-10 shrink-0"
             >
               <Send className="w-5 h-5" />
             </button>
@@ -1006,7 +1040,7 @@ export default function App() {
                   <BarChart2 className="w-6 h-6 text-[#58a6ff]" />
                 </div>
                 <div>
-                  <h2 className="text-2xl font-bold text-white tracking-tight">HSE 全景数据看板 <span className="text-[#8b949e] text-sm font-normal ml-2">| BGP Crew 8615</span></h2>
+                  <h2 className="text-lg md:text-2xl font-bold text-white tracking-tight">HSE 全景数据看板 <span className="hidden sm:inline text-[#8b949e] text-sm font-normal ml-2">| BGP Crew 8615</span></h2>
                 </div>
               </div>
               <button onClick={() => setShowDashboard(false)} className="p-2 text-[#8b949e] hover:text-white hover:bg-[#30363d] rounded-lg transition-colors">
