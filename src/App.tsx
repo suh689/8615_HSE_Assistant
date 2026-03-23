@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Mic, MicOff, ShieldAlert, Activity, ShieldCheck, Zap, Radio, BarChart2, Database, Square, Settings, X, Save } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { createChatSession, getAI } from './lib/gemini';
+import { createChatSession, getAI, resetAI, AIProvider } from './lib/gemini';
 import { Modality } from '@google/genai';
 import { Message, TriggerData } from './types';
 import { cn } from './lib/utils';
@@ -110,13 +110,35 @@ export default function App() {
   const [geminiVoice, setGeminiVoice] = useState(() => localStorage.getItem('geminiVoice') || 'Zephyr');
   const [elKey, setElKey] = useState(() => localStorage.getItem('elevenLabsKey') || '');
   const [elVoice, setElVoice] = useState(() => localStorage.getItem('elevenLabsVoice') || '21m00Tcm4TlvDq8ikWAM');
+  
+  const [aiProvider, setAiProvider] = useState<AIProvider>(() => (localStorage.getItem('ai_provider') as AIProvider) || 'gemini');
+  const [aiApiKey, setAiApiKey] = useState(() => {
+    const newKey = localStorage.getItem('ai_api_key');
+    if (newKey) return newKey;
+    // 迁移旧 Key
+    const oldKey = localStorage.getItem('gemini_api_key');
+    if (oldKey) {
+      localStorage.setItem('ai_api_key', oldKey);
+      return oldKey;
+    }
+    return '';
+  });
+  const [aiBaseUrl, setAiBaseUrl] = useState(() => localStorage.getItem('ai_base_url') || 'https://api.openai.com/v1');
+  const [aiModel, setAiModel] = useState(() => localStorage.getItem('ai_model') || 'gemini-3-flash-preview');
 
   useEffect(() => {
     localStorage.setItem('ttsProvider', ttsProvider);
     localStorage.setItem('geminiVoice', geminiVoice);
     localStorage.setItem('elevenLabsKey', elKey);
     localStorage.setItem('elevenLabsVoice', elVoice);
-  }, [ttsProvider, geminiVoice, elKey, elVoice]);
+    
+    localStorage.setItem('ai_provider', aiProvider);
+    localStorage.setItem('ai_api_key', aiApiKey);
+    localStorage.setItem('ai_base_url', aiBaseUrl);
+    localStorage.setItem('ai_model', aiModel);
+    
+    resetAI(); // 重置 AI 实例以应用新设置
+  }, [ttsProvider, geminiVoice, elKey, elVoice, aiProvider, aiApiKey, aiBaseUrl, aiModel]);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -356,42 +378,32 @@ export default function App() {
   }, [playLocalTTS]);
 
   const parseTriggerData = (text: string): { cleanText: string, triggerData?: TriggerData, newDashboardData?: any } => {
-    // Match with or without markdown code blocks, allowing newlines
-    const regex = /\[TRIGGER_DATA:\s*({[\s\S]*?})\s*\]/;
-    const dashboardRegex = /\[UPDATE_DASHBOARD:\s*({[\s\S]*?})\s*\]/;
+    // 提取完整数据用于逻辑处理
+    const fullTriggerRegex = /\[TRIGGER_DATA:\s*({[\s\S]*?})\s*\]/;
+    const fullDashboardRegex = /\[UPDATE_DASHBOARD:\s*({[\s\S]*?})\s*\]/;
     
-    const match = text.match(regex);
-    const dashMatch = text.match(dashboardRegex);
+    const match = text.match(fullTriggerRegex);
+    const dashMatch = text.match(fullDashboardRegex);
     
-    let cleanText = text;
     let triggerData: TriggerData | undefined;
     let newDashboardData: any | undefined;
 
     if (match && match[1]) {
-      try {
-        triggerData = JSON.parse(match[1]) as TriggerData;
-      } catch (e) {
-        console.error("Failed to parse trigger data", e);
-      }
+      try { triggerData = JSON.parse(match[1]); } catch (e) {}
     }
-
     if (dashMatch && dashMatch[1]) {
-      try {
-        newDashboardData = JSON.parse(dashMatch[1]);
-      } catch (e) {
-        console.error("Failed to parse dashboard data", e);
-      }
+      try { newDashboardData = JSON.parse(dashMatch[1]); } catch (e) {}
     }
 
-    // Aggressively remove ALL trigger data blocks and markdown formatting
-    cleanText = cleanText.replace(/(?:```(?:json)?\s*)?\[TRIGGER_DATA:[\s\S]*?\](?:\s*```)?/gi, '');
-    cleanText = cleanText.replace(/(?:```(?:json)?\s*)?\[UPDATE_DASHBOARD:[\s\S]*?\](?:\s*```)?/gi, '');
-    
-    // Also remove incomplete tags at the end of the string
-    cleanText = cleanText.replace(/(?:```(?:json)?\s*)?\[TRIGGER_DATA:[\s\S]*$/i, '');
-    cleanText = cleanText.replace(/(?:```(?:json)?\s*)?\[UPDATE_DASHBOARD:[\s\S]*$/i, '');
-    
-    cleanText = cleanText.replace(/```json/gi, '').replace(/```/g, '').trim();
+    // 清理文本用于显示和语音播报
+    // 改进：使用更激进的正则，即使标签未闭合（在流式输出末尾）也将其移除
+    let cleanText = text
+      .replace(/\[TRIGGER_DATA:[\s\S]*?(\]|$)/gi, '')
+      .replace(/\[UPDATE_DASHBOARD:[\s\S]*?(\]|$)/gi, '')
+      .replace(/```[\s\S]*?(\]|$|```)/gi, '') // 移除代码块
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
+      .trim();
     
     return { cleanText, triggerData, newDashboardData };
   };
@@ -570,6 +582,9 @@ export default function App() {
           setIsLoading(true);
           try {
             const ai = getAI();
+            if (!ai) {
+              throw new Error("当前模型提供商不支持语音识别，请切换回 Gemini 或检查设置。");
+            }
             const response = await ai.models.generateContent({
               model: "gemini-3-flash-preview",
               contents: [
@@ -1305,8 +1320,75 @@ export default function App() {
                   <X className="w-5 h-5" />
                 </button>
               </div>
-              <div className="p-6 space-y-6">
-                <div className="space-y-2">
+              <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto scrollbar-hide">
+                {/* AI Provider Settings */}
+                <div className="space-y-4 p-4 bg-[#0d1117] rounded-lg border border-[#30363d]">
+                  <h3 className="text-sm font-bold text-[#58a6ff] uppercase tracking-wider">模型提供商 (AI Provider)</h3>
+                  
+                  <div className="space-y-2">
+                    <label className="block text-xs font-medium text-[#8b949e]">选择引擎</label>
+                    <select
+                      value={aiProvider}
+                      onChange={(e) => {
+                        const val = e.target.value as AIProvider;
+                        setAiProvider(val);
+                        if (val === 'gemini') setAiModel('gemini-3-flash-preview');
+                        else if (val === 'openai') {
+                          setAiBaseUrl('https://api.openai.com/v1');
+                          setAiModel('gpt-4o');
+                        } else if (val === 'local') {
+                          setAiBaseUrl('http://localhost:11434/v1'); // Ollama default
+                          setAiModel('llama3');
+                        }
+                      }}
+                      className="w-full bg-[#161b22] border border-[#30363d] rounded-md px-3 py-2 text-white focus:outline-none focus:border-[#58a6ff]"
+                    >
+                      <option value="gemini">Google Gemini (推荐)</option>
+                      <option value="openai">OpenAI (GPT-4o/o1)</option>
+                      <option value="local">本地大模型 (Ollama/LM Studio)</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="block text-xs font-medium text-[#8b949e]">API Key</label>
+                    <input
+                      type="password"
+                      value={aiApiKey}
+                      onChange={(e) => setAiApiKey(e.target.value)}
+                      placeholder={aiProvider === 'local' ? "本地模型通常不需要 Key" : "sk-..."}
+                      className="w-full bg-[#161b22] border border-[#30363d] rounded-md px-3 py-2 text-white focus:outline-none focus:border-[#58a6ff]"
+                    />
+                  </div>
+
+                  {(aiProvider === 'openai' || aiProvider === 'local') && (
+                    <div className="space-y-2">
+                      <label className="block text-xs font-medium text-[#8b949e]">API Base URL</label>
+                      <input
+                        type="text"
+                        value={aiBaseUrl}
+                        onChange={(e) => setAiBaseUrl(e.target.value)}
+                        placeholder="https://api.openai.com/v1"
+                        className="w-full bg-[#161b22] border border-[#30363d] rounded-md px-3 py-2 text-white focus:outline-none focus:border-[#58a6ff]"
+                      />
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    <label className="block text-xs font-medium text-[#8b949e]">模型名称 (Model Name)</label>
+                    <input
+                      type="text"
+                      value={aiModel}
+                      onChange={(e) => setAiModel(e.target.value)}
+                      placeholder="gemini-3-flash-preview"
+                      className="w-full bg-[#161b22] border border-[#30363d] rounded-md px-3 py-2 text-white focus:outline-none focus:border-[#58a6ff]"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-4 p-4 bg-[#0d1117] rounded-lg border border-[#30363d]">
+                  <h3 className="text-sm font-bold text-[#58a6ff] uppercase tracking-wider">语音设置 (Voice Settings)</h3>
+                  
+                  <div className="space-y-2">
                   <label className="block text-sm font-medium text-[#c9d1d9]">TTS 引擎 (Provider)</label>
                   <select
                     value={ttsProvider}
@@ -1365,6 +1447,7 @@ export default function App() {
                     </div>
                   </>
                 )}
+                </div>
               </div>
               <div className="p-4 border-t border-[#30363d] bg-[#0d1117] flex justify-end">
                 <button
