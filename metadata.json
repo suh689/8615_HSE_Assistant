@@ -1,0 +1,5 @@
+{
+  "name": "Crew-8615 HSE Assistant",
+  "description": "CNPC BGP Crew 8615 HSE Digital Intelligent Commander with real-time telemetry and voice synthesis.",
+  "requestFramePermissions": ["microphone"]
+}
